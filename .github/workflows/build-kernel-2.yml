@@ -1,0 +1,397 @@
+name: Build klte kernel + boot.img
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: "Defconfig (NFC cipine gore; emin degilsen device tree'deki TARGET_KERNEL_CONFIG'e bak)"
+        type: choice
+        default: lineage_klte_pn547_defconfig
+        options:
+          - lineage_klte_pn547_defconfig
+          - lineage_klte_bcm2079x_defconfig
+          - lineage_klteduos_defconfig
+          - lineage_kltechn_defconfig
+          - lineage_kltechnduo_defconfig
+          - lineage_kltekor_defconfig
+          - lineage_kltekdi_defconfig
+          - lineage_kltesprsports_defconfig
+          - lineage_klteactivexx_defconfig
+      dtb_prefix:
+        description: "DTB on eki (bos = defconfig'e gore). Ornek: msm8974pro-ac-sec-k-r"
+        type: string
+        default: ""
+      base_boot_url:
+        description: "Calisan boot.img icin dogrudan indirme linki (bos = repodaki boot/boot.img)"
+        type: string
+        default: ""
+      cmdline:
+        description: "Yeni kernel cmdline (bos = boot.img'deki mevcut cmdline aynen kalir)"
+        type: string
+        default: ""
+  push:
+    branches: [lineage-21, main, master]
+    paths-ignore:
+      - "**.md"
+      - "patches/**"
+
+concurrency:
+  group: kernel-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEFCONFIG: ${{ inputs.defconfig || 'lineage_klte_pn547_defconfig' }}
+  DTB_PREFIX_INPUT: ${{ inputs.dtb_prefix || '' }}
+  BASE_BOOT_URL: ${{ inputs.base_boot_url || '' }}
+  NEW_CMDLINE: ${{ inputs.cmdline || '' }}
+  # AOSP gcc 4.9: 3.4 kernel yeni gcc ile derlenmez (compiler-gcc5.h yok).
+  TOOLCHAIN_REPO: https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9
+  TOOLCHAIN_BRANCHES: "pie-release android-9.0.0_r1 oreo-release master"
+  TOOLCHAIN_MIRROR: https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9
+  TOOLCHAIN_MIRROR_BRANCHES: "lineage-19.1 lineage-18.1 lineage-16.0"
+  ARCH: arm
+  # Runner'da libyaml-dev kurulu; 3.4 kbuild'i dtc'ye -lyaml baglamiyor (link hatasi).
+  # pkg-config'i kor ederek dtc'yi YAML'siz (NO_YAML) derletiyoruz.
+  PKG_CONFIG_LIBDIR: /nonexistent
+  KBUILD_BUILD_USER: github
+  KBUILD_BUILD_HOST: actions
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Apply patches (patches/*.patch varsa)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for p in patches/*.patch; do
+            if git apply --check "$p" 2>/dev/null; then
+              echo "apply: $p"
+              git apply "$p"
+            elif git apply -R --check "$p" 2>/dev/null; then
+              echo "zaten uygulanmis: $p"
+            else
+              echo "::error::$p uygulanamadi"
+              exit 1
+            fi
+          done
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex lz4 libssl-dev libncurses-dev perl python3 xz-utils git curl ca-certificates
+
+      - name: Cache toolchain
+        id: tc-cache
+        uses: actions/cache@v4
+        with:
+          path: toolchain
+          key: aosp-gcc49-arm-androideabi-v1
+
+      - name: Fetch toolchain (AOSP gcc 4.9)
+        if: steps.tc-cache.outputs.cache-hit != 'true'
+        run: |
+          set -uo pipefail
+          ok=0
+          try_clone() {
+            local url="$1"; shift
+            for b in "$@"; do
+              echo "::group::clone $url @ $b"
+              rm -rf toolchain
+              if git clone --depth=1 -b "$b" "$url" toolchain; then
+                echo "::endgroup::"; return 0
+              fi
+              echo "::endgroup::"
+            done
+            return 1
+          }
+          # shellcheck disable=SC2086
+          try_clone "$TOOLCHAIN_REPO" $TOOLCHAIN_BRANCHES && ok=1
+          # shellcheck disable=SC2086
+          [ "$ok" = 1 ] || { try_clone "$TOOLCHAIN_MIRROR" $TOOLCHAIN_MIRROR_BRANCHES && ok=1; }
+          if [ "$ok" != 1 ]; then
+            echo "::error::Toolchain indirilemedi. TOOLCHAIN_REPO / TOOLCHAIN_BRANCHES degiskenlerini duzelt."
+            exit 1
+          fi
+          rm -rf toolchain/.git
+
+      - name: Check toolchain
+        run: |
+          "$GITHUB_WORKSPACE/toolchain/bin/arm-linux-androideabi-gcc" --version | head -1
+
+      - name: Configure
+        run: |
+          set -euo pipefail
+          export CROSS_COMPILE="$GITHUB_WORKSPACE/toolchain/bin/arm-linux-androideabi-"
+          test -f "arch/arm/configs/$DEFCONFIG" || { echo "::error::$DEFCONFIG yok"; exit 1; }
+          make O=out "$DEFCONFIG"
+
+      - name: Build zImage
+        run: |
+          set -euo pipefail
+          export CROSS_COMPILE="$GITHUB_WORKSPACE/toolchain/bin/arm-linux-androideabi-"
+          make O=out -j"$(nproc)" 2>&1 | tee build.log
+          test -f out/arch/arm/boot/zImage
+
+      - name: Build DTBs
+        run: |
+          set -euo pipefail
+          export CROSS_COMPILE="$GITHUB_WORKSPACE/toolchain/bin/arm-linux-androideabi-"
+          prefix="$DTB_PREFIX_INPUT"
+          if [ -z "$prefix" ]; then
+            case "$DEFCONFIG" in
+              lineage_klte_pn547_defconfig|lineage_klte_bcm2079x_defconfig|lineage_klteduos_defconfig)
+                prefix=msm8974pro-ac-sec-k-r ;;
+              lineage_kltechn_defconfig|lineage_kltechnduo_defconfig) prefix=msm8974pro-ac-sec-kchn-r ;;
+              lineage_kltekor_defconfig)      prefix=msm8974pro-ac-sec-kkor-r ;;
+              lineage_kltekdi_defconfig)      prefix=msm8974pro-ac-sec-kjpn-r ;;
+              lineage_kltesprsports_defconfig) prefix=msm8974pro-ac-sec-ksports-r ;;
+              lineage_klteactivexx_defconfig) prefix=msm8974pro-ac-sec-kactivelte-r ;;
+              *) prefix=msm8974pro-ac-sec-k-r ;;
+            esac
+          fi
+          echo "DTB prefix: $prefix"
+          shopt -s nullglob
+          dts=(arch/arm/boot/dts/msm8974pro/"$prefix"*.dts)
+          if [ "${#dts[@]}" -eq 0 ]; then
+            echo "::error::'$prefix' ile baslayan dts yok. Mevcut olanlar:"
+            ls arch/arm/boot/dts/msm8974pro | grep 'sec-k' | grep '\.dts$' || true
+            exit 1
+          fi
+          for f in "${dts[@]}"; do
+            n="$(basename "$f" .dts)"
+            make O=out "$n.dtb"
+          done
+          ls -la out/arch/arm/boot/*.dtb
+
+      - name: Build dt.img (QCDT)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # tools/dtbTool 32-bit ELF; i386 libc gerekiyor.
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libc6:i386
+          chmod +x tools/dtbTool
+          tools/dtbTool -s 2048 -o out/arch/arm/boot/dt.img -p out/scripts/dtc/ out/arch/arm/boot/
+          ls -la out/arch/arm/boot/dt.img
+
+      - name: Collect kernel artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp out/arch/arm/boot/zImage dist/
+          [ -f out/arch/arm/boot/Image ] && cp out/arch/arm/boot/Image dist/ || true
+          [ -f out/arch/arm/boot/dt.img ] && cp out/arch/arm/boot/dt.img dist/ || true
+          cp out/arch/arm/boot/*.dtb dist/ 2>/dev/null || true
+          cp out/.config dist/config
+          cp out/System.map dist/ 2>/dev/null || true
+          cp build.log dist/
+          {
+            echo "defconfig: $DEFCONFIG"
+            echo "commit:    $GITHUB_SHA"
+            echo "release:   $(cat out/include/config/kernel.release 2>/dev/null || true)"
+            echo "gcc:       $("$GITHUB_WORKSPACE/toolchain/bin/arm-linux-androideabi-gcc" --version | head -1)"
+          } | tee dist/BUILD_INFO.txt
+
+      - name: Get base boot.img
+        id: base
+        run: |
+          set -euo pipefail
+          mkdir -p base
+          if [ -n "$BASE_BOOT_URL" ]; then
+            echo "boot.img indiriliyor: girilen link"
+            curl -fL --retry 3 -o base/boot.img "$BASE_BOOT_URL"
+            echo "have=true" >> "$GITHUB_OUTPUT"
+          elif [ -f boot/boot.img ]; then
+            echo "repodaki boot/boot.img kullaniliyor"
+            cp boot/boot.img base/boot.img
+            echo "have=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Taban boot.img yok (base_boot_url bos ve boot/boot.img yok). Yalniz kernel/dt.img uretildi, boot.img atlandi."
+            echo "have=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pack boot.img
+        if: steps.base.outputs.have == 'true'
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/repack_boot.py" <<'PYEOF'
+          #!/usr/bin/env python3
+          """
+          Mevcut bir Android boot.img (header v0, Qualcomm dt_size'li, ornek: Galaxy S5 klte)
+          icindeki kernel ve dt.img'yi degistirir; ramdisk, adresler, cmdline, page size
+          ve Samsung SEANDROIDENFORCE etiketi aynen korunur.
+
+          Kullanim:
+            python3 repack_boot.py boot.img --info
+            python3 repack_boot.py boot.img --kernel zImage --dt dt.img -o new-boot.img
+            (istege bagli) --cmdline "yeni cmdline"
+          """
+          import argparse, hashlib, struct, sys
+
+          MAGIC = b"ANDROID!"
+          HDR = "<8s10I16s512s32s"          # 608 bayt; extra_cmdline (1024) ayri okunur
+          HDR_SIZE = struct.calcsize(HDR)
+          SAMSUNG_TAG = b"SEANDROIDENFORCE"
+          KLTE_BOOT_PART = 15 * 1024 * 1024  # yaklasik; sadece uyari icin
+
+
+          def align(n, page):
+              return (n + page - 1) // page * page
+
+
+          def parse(data):
+              if data[:8] != MAGIC:
+                  sys.exit("HATA: ANDROID! imzasi yok, bu bir boot.img degil.")
+              (magic, ksize, kaddr, rsize, raddr, ssize, saddr, taddr, page, dtsize,
+               unused, name, cmdline, bid) = struct.unpack_from(HDR, data, 0)
+              if page not in (2048, 4096, 8192, 16384):
+                  sys.exit("HATA: beklenmeyen page size: %d" % page)
+              if dtsize <= 4 and dtsize != 0:
+                  sys.exit("HATA: header v%d gibi gorunuyor (bu arac yalniz v0/QCDT icin)." % dtsize)
+              extra = data[HDR_SIZE:HDR_SIZE + 1024]
+              off = page
+              kernel = data[off:off + ksize]; off += align(ksize, page)
+              ramdisk = data[off:off + rsize]; off += align(rsize, page)
+              second = data[off:off + ssize]; off += align(ssize, page)
+              dt = data[off:off + dtsize]; off += align(dtsize, page)
+              tail = data[off:]
+              return dict(kaddr=kaddr, raddr=raddr, saddr=saddr, taddr=taddr, page=page,
+                          unused=unused, name=name, cmdline=cmdline, extra=extra,
+                          kernel=kernel, ramdisk=ramdisk, second=second, dt=dt, tail=tail)
+
+
+          def build(p):
+              page = p["page"]
+              ksize, rsize, ssize, dtsize = (len(p["kernel"]), len(p["ramdisk"]),
+                                             len(p["second"]), len(p["dt"]))
+              h = hashlib.sha1()
+              for blob in (p["kernel"], p["ramdisk"], p["second"]):
+                  h.update(blob); h.update(struct.pack("<I", len(blob)))
+              if dtsize:
+                  h.update(p["dt"]); h.update(struct.pack("<I", dtsize))
+              bid = h.digest().ljust(32, b"\0")
+              hdr = struct.pack(HDR, MAGIC, ksize, p["kaddr"], rsize, p["raddr"], ssize,
+                                p["saddr"], p["taddr"], page, dtsize, p["unused"],
+                                p["name"], p["cmdline"], bid) + p["extra"]
+              out = bytearray(hdr.ljust(page, b"\0"))
+              for blob in (p["kernel"], p["ramdisk"], p["second"], p["dt"]):
+                  if blob:
+                      out += blob.ljust(align(len(blob), page), b"\0")
+              out += p["tail"]  # Samsung SEANDROIDENFORCE vb. korunur
+              return bytes(out)
+
+
+          def cstr(b):
+              return b.split(b"\0", 1)[0].decode("ascii", "replace")
+
+
+          def info(p):
+              print("page size   :", p["page"])
+              print("kernel      : %d bayt @ 0x%08x" % (len(p["kernel"]), p["kaddr"]))
+              print("ramdisk     : %d bayt @ 0x%08x" % (len(p["ramdisk"]), p["raddr"]))
+              print("second      : %d bayt @ 0x%08x" % (len(p["second"]), p["saddr"]))
+              print("dt          : %d bayt (magic %r)" % (len(p["dt"]), p["dt"][:4]))
+              print("tags        : 0x%08x" % p["taddr"])
+              print("name        :", repr(cstr(p["name"])))
+              print("cmdline     :", cstr(p["cmdline"]))
+              if p["extra"].strip(b"\0"):
+                  print("extra cmd   :", cstr(p["extra"]))
+              print("tail        :", p["tail"][:32] if p["tail"] else b"(yok)")
+
+
+          def main():
+              ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+              ap.add_argument("boot")
+              ap.add_argument("--kernel"); ap.add_argument("--dt")
+              ap.add_argument("--cmdline"); ap.add_argument("-o", "--output")
+              ap.add_argument("--info", action="store_true")
+              a = ap.parse_args()
+
+              p = parse(open(a.boot, "rb").read())
+              if a.info or not (a.kernel or a.dt or a.cmdline):
+                  info(p); return
+              if not a.output:
+                  sys.exit("HATA: -o <cikti.img> gerekli.")
+              if a.kernel:
+                  p["kernel"] = open(a.kernel, "rb").read()
+              if a.dt:
+                  d = open(a.dt, "rb").read()
+                  if d[:4] != b"QCDT":
+                      sys.exit("HATA: dt.img QCDT degil.")
+                  p["dt"] = d
+              if a.cmdline is not None:
+                  c = a.cmdline.encode()
+                  if len(c) > 512 + 1024 - 1:
+                      sys.exit("HATA: cmdline cok uzun.")
+                  p["cmdline"] = c[:511].ljust(512, b"\0")
+                  p["extra"] = c[511:].ljust(1024, b"\0")
+              if not p["tail"].startswith(SAMSUNG_TAG) and p["tail"] == b"":
+                  print("Not: orijinalde SEANDROIDENFORCE etiketi yok, eklenmedi.")
+              out = build(p)
+              open(a.output, "wb").write(out)
+              print("Yazildi: %s (%d bayt, sha1 %s)" % (a.output, len(out), hashlib.sha1(out).hexdigest()))
+              if len(out) > KLTE_BOOT_PART:
+                  print("UYARI: boot bolumu (~15 MB) sinirini asiyor olabilir, flash etme!")
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          echo "=== Taban boot.img ==="
+          python3 "$RUNNER_TEMP/repack_boot.py" base/boot.img --info
+          args=(base/boot.img --kernel out/arch/arm/boot/zImage -o dist/boot.img)
+          if [ -f out/arch/arm/boot/dt.img ]; then
+            args+=(--dt out/arch/arm/boot/dt.img)
+          else
+            echo "::warning::dt.img uretilemedi; taban boot.img'deki dt korunuyor."
+          fi
+          if [ -n "$NEW_CMDLINE" ]; then
+            args+=(--cmdline "$NEW_CMDLINE")
+          fi
+          python3 "$RUNNER_TEMP/repack_boot.py" "${args[@]}"
+          echo "=== Yeni boot.img ==="
+          python3 "$RUNNER_TEMP/repack_boot.py" dist/boot.img --info
+          size=$(stat -c %s dist/boot.img)
+          echo "boot.img boyutu: $size bayt"
+          if [ "$size" -gt 15728640 ]; then
+            echo "::error::boot.img 15 MiB'i asiyor; klte boot bolumune sigmaz."
+            exit 1
+          fi
+          # Odin icin .tar.md5
+          (cd dist && tar -H ustar -c boot.img > boot.tar && md5sum -t boot.tar >> boot.tar && mv boot.tar boot.tar.md5)
+          ls -la dist/boot.img dist/boot.tar.md5
+
+      - name: Checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum zImage boot.img boot.tar.md5 dt.img 2>/dev/null | tee SHA256SUMS
+
+      - name: Upload boot.img (yalniz)
+        if: steps.base.outputs.have == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-img-${{ github.run_number }}
+          path: |
+            dist/boot.img
+            dist/boot.tar.md5
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload all artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: klte-kernel-${{ env.DEFCONFIG }}-${{ github.run_number }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
