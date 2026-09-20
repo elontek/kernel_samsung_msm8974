@@ -1,0 +1,202 @@
+name: Build klte kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: "Defconfig (NFC cipine gore; emin degilsen device tree'deki TARGET_KERNEL_CONFIG'e bak)"
+        type: choice
+        default: lineage_klte_pn547_defconfig
+        options:
+          - lineage_klte_pn547_defconfig
+          - lineage_klte_bcm2079x_defconfig
+          - lineage_klteduos_defconfig
+          - lineage_kltechn_defconfig
+          - lineage_kltechnduo_defconfig
+          - lineage_kltekor_defconfig
+          - lineage_kltekdi_defconfig
+          - lineage_kltesprsports_defconfig
+          - lineage_klteactivexx_defconfig
+      dtb_prefix:
+        description: "DTB on eki (bos birakirsan defconfig'e gore secilir). Ornek: msm8974pro-ac-sec-k-r"
+        type: string
+        default: ""
+  push:
+    branches: [lineage-21, main, master]
+    paths-ignore:
+      - "**.md"
+      - "patches/**"
+
+concurrency:
+  group: kernel-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEFCONFIG: ${{ inputs.defconfig || 'lineage_klte_pn547_defconfig' }}
+  DTB_PREFIX_INPUT: ${{ inputs.dtb_prefix || '' }}
+  # AOSP gcc 4.9: 3.4 kernel yeni gcc ile derlenmez (compiler-gcc5.h yok).
+  TOOLCHAIN_REPO: https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9
+  TOOLCHAIN_BRANCHES: "pie-release android-9.0.0_r1 oreo-release master"
+  TOOLCHAIN_MIRROR: https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_arm_arm-linux-androideabi-4.9
+  TOOLCHAIN_MIRROR_BRANCHES: "lineage-19.1 lineage-18.1 lineage-16.0"
+  ARCH: arm
+  # Runner'da libyaml-dev kurulu; 3.4 kbuild'i dtc'ye -lyaml baglamiyor (link hatasi).
+  # pkg-config'i kor ederek dtc'yi YAML'siz (NO_YAML) derletiyoruz.
+  PKG_CONFIG_LIBDIR: /nonexistent
+  KBUILD_BUILD_USER: github
+  KBUILD_BUILD_HOST: actions
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Apply patches (patches/*.patch varsa)
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for p in patches/*.patch; do
+            if git apply --check "$p" 2>/dev/null; then
+              echo "apply: $p"
+              git apply "$p"
+            elif git apply -R --check "$p" 2>/dev/null; then
+              echo "zaten uygulanmis: $p"
+            else
+              echo "::error::$p uygulanamadi"
+              exit 1
+            fi
+          done
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex lz4 libssl-dev libncurses-dev perl python3 xz-utils git ca-certificates
+
+      - name: Cache toolchain
+        id: tc-cache
+        uses: actions/cache@v4
+        with:
+          path: toolchain
+          key: aosp-gcc49-arm-androideabi-v1
+
+      - name: Fetch toolchain (AOSP gcc 4.9)
+        if: steps.tc-cache.outputs.cache-hit != 'true'
+        run: |
+          set -uo pipefail
+          ok=0
+          try_clone() {
+            local url="$1"; shift
+            for b in "$@"; do
+              echo "::group::clone $url @ $b"
+              rm -rf toolchain
+              if git clone --depth=1 -b "$b" "$url" toolchain; then
+                echo "::endgroup::"; return 0
+              fi
+              echo "::endgroup::"
+            done
+            return 1
+          }
+          # shellcheck disable=SC2086
+          try_clone "$TOOLCHAIN_REPO" $TOOLCHAIN_BRANCHES && ok=1
+          # shellcheck disable=SC2086
+          [ "$ok" = 1 ] || { try_clone "$TOOLCHAIN_MIRROR" $TOOLCHAIN_MIRROR_BRANCHES && ok=1; }
+          if [ "$ok" != 1 ]; then
+            echo "::error::Toolchain indirilemedi. TOOLCHAIN_REPO / TOOLCHAIN_BRANCHES degiskenlerini duzelt."
+            exit 1
+          fi
+          rm -rf toolchain/.git
+
+      - name: Check toolchain
+        run: |
+          "$GITHUB_WORKSPACE/toolchain/bin/arm-linux-androideabi-gcc" --version | head -1
+
+      - name: Configure
+        run: |
+          set -euo pipefail
+          export CROSS_COMPILE="$GITHUB_WORKSPACE/toolchain/bin/arm-linux-androideabi-"
+          test -f "arch/arm/configs/$DEFCONFIG" || { echo "::error::$DEFCONFIG yok"; exit 1; }
+          make O=out "$DEFCONFIG"
+
+      - name: Build zImage
+        run: |
+          set -euo pipefail
+          export CROSS_COMPILE="$GITHUB_WORKSPACE/toolchain/bin/arm-linux-androideabi-"
+          make O=out -j"$(nproc)" 2>&1 | tee build.log
+          test -f out/arch/arm/boot/zImage
+
+      - name: Build DTBs
+        run: |
+          set -euo pipefail
+          export CROSS_COMPILE="$GITHUB_WORKSPACE/toolchain/bin/arm-linux-androideabi-"
+          prefix="$DTB_PREFIX_INPUT"
+          if [ -z "$prefix" ]; then
+            case "$DEFCONFIG" in
+              lineage_klte_pn547_defconfig|lineage_klte_bcm2079x_defconfig|lineage_klteduos_defconfig)
+                prefix=msm8974pro-ac-sec-k-r ;;
+              lineage_kltechn_defconfig|lineage_kltechnduo_defconfig) prefix=msm8974pro-ac-sec-kchn-r ;;
+              lineage_kltekor_defconfig)      prefix=msm8974pro-ac-sec-kkor-r ;;
+              lineage_kltekdi_defconfig)      prefix=msm8974pro-ac-sec-kjpn-r ;;
+              lineage_kltesprsports_defconfig) prefix=msm8974pro-ac-sec-ksports-r ;;
+              lineage_klteactivexx_defconfig) prefix=msm8974pro-ac-sec-kactivelte-r ;;
+              *) prefix=msm8974pro-ac-sec-k-r ;;
+            esac
+          fi
+          echo "DTB prefix: $prefix"
+          shopt -s nullglob
+          dts=(arch/arm/boot/dts/msm8974pro/"$prefix"*.dts)
+          if [ "${#dts[@]}" -eq 0 ]; then
+            echo "::error::'$prefix' ile baslayan dts yok. Mevcut olanlar:"
+            ls arch/arm/boot/dts/msm8974pro | grep 'sec-k' | grep '\.dts$' || true
+            exit 1
+          fi
+          for f in "${dts[@]}"; do
+            n="$(basename "$f" .dts)"
+            make O=out "$n.dtb"
+          done
+          ls -la out/arch/arm/boot/*.dtb
+
+      - name: Build dt.img (QCDT, optional)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          # tools/dtbTool 32-bit ELF; i386 libc gerekiyor.
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libc6:i386
+          chmod +x tools/dtbTool
+          tools/dtbTool -s 2048 -o out/arch/arm/boot/dt.img -p out/scripts/dtc/ out/arch/arm/boot/
+          ls -la out/arch/arm/boot/dt.img
+
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp out/arch/arm/boot/zImage dist/
+          [ -f out/arch/arm/boot/Image ] && cp out/arch/arm/boot/Image dist/ || true
+          [ -f out/arch/arm/boot/dt.img ] && cp out/arch/arm/boot/dt.img dist/ || true
+          cp out/arch/arm/boot/*.dtb dist/ 2>/dev/null || true
+          cp out/.config dist/config
+          cp out/System.map dist/ 2>/dev/null || true
+          cp build.log dist/
+          {
+            echo "defconfig: $DEFCONFIG"
+            echo "commit:    $GITHUB_SHA"
+            echo "release:   $(cat out/include/config/kernel.release 2>/dev/null || true)"
+            echo "gcc:       $("$GITHUB_WORKSPACE/toolchain/bin/arm-linux-androideabi-gcc" --version | head -1)"
+          } | tee dist/BUILD_INFO.txt
+          (cd dist && sha256sum zImage dt.img 2>/dev/null | tee SHA256SUMS)
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: klte-kernel-${{ env.DEFCONFIG }}-${{ github.run_number }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
