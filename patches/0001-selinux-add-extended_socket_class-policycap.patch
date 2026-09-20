@@ -1,0 +1,179 @@
+diff -ruN a/security/selinux/hooks.c b/security/selinux/hooks.c
+--- a/security/selinux/hooks.c	2026-09-20 15:47:34.407543996 +0000
++++ b/security/selinux/hooks.c	2026-09-20 15:47:34.409215287 +0000
+@@ -1103,6 +1103,8 @@
+ 
+ static inline u16 socket_type_to_security_class(int family, int type, int protocol)
+ {
++	int extsockclass = selinux_policycap_extsockclass;
++
+ 	switch (family) {
+ 	case PF_UNIX:
+ 		switch (type) {
+@@ -1117,13 +1119,19 @@
+ 	case PF_INET6:
+ 		switch (type) {
+ 		case SOCK_STREAM:
++		case SOCK_SEQPACKET:
+ 			if (default_protocol_stream(protocol))
+ 				return SECCLASS_TCP_SOCKET;
++			else if (extsockclass && protocol == IPPROTO_SCTP)
++				return SECCLASS_SCTP_SOCKET;
+ 			else
+ 				return SECCLASS_RAWIP_SOCKET;
+ 		case SOCK_DGRAM:
+ 			if (default_protocol_dgram(protocol))
+ 				return SECCLASS_UDP_SOCKET;
++			else if (extsockclass && (protocol == IPPROTO_ICMP ||
++						  protocol == IPPROTO_ICMPV6))
++				return SECCLASS_ICMP_SOCKET;
+ 			else
+ 				return SECCLASS_RAWIP_SOCKET;
+ 		case SOCK_DCCP:
+@@ -1177,6 +1185,57 @@
+ 		return SECCLASS_APPLETALK_SOCKET;
+ 	}
+ 
++	if (extsockclass) {
++		switch (family) {
++		case PF_AX25:
++			return SECCLASS_AX25_SOCKET;
++		case PF_IPX:
++			return SECCLASS_IPX_SOCKET;
++		case PF_NETROM:
++			return SECCLASS_NETROM_SOCKET;
++		case PF_ATMPVC:
++			return SECCLASS_ATMPVC_SOCKET;
++		case PF_X25:
++			return SECCLASS_X25_SOCKET;
++		case PF_ROSE:
++			return SECCLASS_ROSE_SOCKET;
++		case PF_DECnet:
++			return SECCLASS_DECNET_SOCKET;
++		case PF_ATMSVC:
++			return SECCLASS_ATMSVC_SOCKET;
++		case PF_RDS:
++			return SECCLASS_RDS_SOCKET;
++		case PF_IRDA:
++			return SECCLASS_IRDA_SOCKET;
++		case PF_PPPOX:
++			return SECCLASS_PPPOX_SOCKET;
++		case PF_LLC:
++			return SECCLASS_LLC_SOCKET;
++		case PF_CAN:
++			return SECCLASS_CAN_SOCKET;
++		case PF_TIPC:
++			return SECCLASS_TIPC_SOCKET;
++		case PF_BLUETOOTH:
++			return SECCLASS_BLUETOOTH_SOCKET;
++		case PF_IUCV:
++			return SECCLASS_IUCV_SOCKET;
++		case PF_RXRPC:
++			return SECCLASS_RXRPC_SOCKET;
++		case PF_ISDN:
++			return SECCLASS_ISDN_SOCKET;
++		case PF_PHONET:
++			return SECCLASS_PHONET_SOCKET;
++		case PF_IEEE802154:
++			return SECCLASS_IEEE802154_SOCKET;
++		case PF_CAIF:
++			return SECCLASS_CAIF_SOCKET;
++		case PF_ALG:
++			return SECCLASS_ALG_SOCKET;
++		case PF_NFC:
++			return SECCLASS_NFC_SOCKET;
++		}
++	}
++
+ 	return SECCLASS_SOCKET;
+ }
+ 
+diff -ruN a/security/selinux/include/classmap.h b/security/selinux/include/classmap.h
+--- a/security/selinux/include/classmap.h	2026-09-20 15:47:34.400693336 +0000
++++ b/security/selinux/include/classmap.h	2026-09-20 15:47:34.402263256 +0000
+@@ -159,5 +159,32 @@
+ 	{ "tun_socket",
+ 	  { COMMON_SOCK_PERMS, NULL } },
+ 	{ "binder", { "impersonate", "call", "set_context_mgr", "transfer", NULL } },
++	{ "icmp_socket",
++	  { COMMON_SOCK_PERMS, "node_bind", NULL } },
++	{ "sctp_socket",
++	  { COMMON_SOCK_PERMS, "node_bind", "name_connect", "association", NULL } },
++	{ "ax25_socket", { COMMON_SOCK_PERMS, NULL } },
++	{ "ipx_socket", { COMMON_SOCK_PERMS, NULL } },
++	{ "netrom_socket", { COMMON_SOCK_PERMS, NULL } },
++	{ "atmpvc_socket", { COMMON_SOCK_PERMS, NULL } },
++	{ "x25_socket", { COMMON_SOCK_PERMS, NULL } },
++	{ "rose_socket", { COMMON_SOCK_PERMS, NULL } },
++	{ "decnet_socket", { COMMON_SOCK_PERMS, NULL } },
++	{ "atmsvc_socket", { COMMON_SOCK_PERMS, NULL } },
++	{ "rds_socket", { COMMON_SOCK_PERMS, NULL } },
++	{ "irda_socket", { COMMON_SOCK_PERMS, NULL } },
++	{ "pppox_socket", { COMMON_SOCK_PERMS, NULL } },
++	{ "llc_socket", { COMMON_SOCK_PERMS, NULL } },
++	{ "can_socket", { COMMON_SOCK_PERMS, NULL } },
++	{ "tipc_socket", { COMMON_SOCK_PERMS, NULL } },
++	{ "bluetooth_socket", { COMMON_SOCK_PERMS, NULL } },
++	{ "iucv_socket", { COMMON_SOCK_PERMS, NULL } },
++	{ "rxrpc_socket", { COMMON_SOCK_PERMS, NULL } },
++	{ "isdn_socket", { COMMON_SOCK_PERMS, NULL } },
++	{ "phonet_socket", { COMMON_SOCK_PERMS, NULL } },
++	{ "ieee802154_socket", { COMMON_SOCK_PERMS, NULL } },
++	{ "caif_socket", { COMMON_SOCK_PERMS, NULL } },
++	{ "alg_socket", { COMMON_SOCK_PERMS, NULL } },
++	{ "nfc_socket", { COMMON_SOCK_PERMS, NULL } },
+ 	{ NULL }
+   };
+diff -ruN a/security/selinux/include/security.h b/security/selinux/include/security.h
+--- a/security/selinux/include/security.h	2026-09-20 15:47:34.414664187 +0000
++++ b/security/selinux/include/security.h	2026-09-20 15:47:34.416147210 +0000
+@@ -71,12 +71,14 @@
+ enum {
+ 	POLICYDB_CAPABILITY_NETPEER,
+ 	POLICYDB_CAPABILITY_OPENPERM,
++	POLICYDB_CAPABILITY_EXTSOCKCLASS,
+ 	__POLICYDB_CAPABILITY_MAX
+ };
+ #define POLICYDB_CAPABILITY_MAX (__POLICYDB_CAPABILITY_MAX - 1)
+ 
+ extern int selinux_policycap_netpeer;
+ extern int selinux_policycap_openperm;
++extern int selinux_policycap_extsockclass;
+ 
+ /*
+  * type_datum properties
+diff -ruN a/security/selinux/selinuxfs.c b/security/selinux/selinuxfs.c
+--- a/security/selinux/selinuxfs.c	2026-09-20 15:47:34.428249167 +0000
++++ b/security/selinux/selinuxfs.c	2026-09-20 15:47:34.429396037 +0000
+@@ -52,7 +52,8 @@
+ /* Policy capability filenames */
+ static char *policycap_names[] = {
+ 	"network_peer_controls",
+-	"open_perms"
++	"open_perms",
++	"extended_socket_class"
+ };
+ 
+ unsigned int selinux_checkreqprot = CONFIG_SECURITY_SELINUX_CHECKREQPROT_VALUE;
+diff -ruN a/security/selinux/ss/services.c b/security/selinux/ss/services.c
+--- a/security/selinux/ss/services.c	2026-09-20 15:47:34.421658793 +0000
++++ b/security/selinux/ss/services.c	2026-09-20 15:47:34.423162630 +0000
+@@ -72,6 +72,7 @@
+ 
+ int selinux_policycap_netpeer;
+ int selinux_policycap_openperm;
++int selinux_policycap_extsockclass;
+ 
+ static DEFINE_RWLOCK(policy_rwlock);
+ 
+@@ -1996,6 +1997,10 @@
+ 						  POLICYDB_CAPABILITY_NETPEER);
+ 	selinux_policycap_openperm = ebitmap_get_bit(&policydb.policycaps,
+ 						  POLICYDB_CAPABILITY_OPENPERM);
++	selinux_policycap_extsockclass = ebitmap_get_bit(&policydb.policycaps,
++						  POLICYDB_CAPABILITY_EXTSOCKCLASS);
++	printk(KERN_INFO "SELinux:  policy capability extended_socket_class=%d\n",
++	       selinux_policycap_extsockclass);
+ }
+ 
+ static int security_preserve_bools(struct policydb *p);
